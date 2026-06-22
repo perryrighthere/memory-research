@@ -1,150 +1,302 @@
 # Agent 框架 Memory 与 Session 管理调研
 
-本调研面向当前仓库中的三个项目：OpenClaw、OpenHarness/ohmo（用户描述为 OpenHarmony，仓库内对应目录为 `OpenHarness`）和 Hermes Agent。结论基于三个并行 subagent 对源码和文档的只读检查，并在主线程复核关键文件后整理。
+本调研面向当前仓库中的三个项目：`hermes-agent`、`openclaw`、`OpenHarness/ohmo`。结论基于仓库源码和项目内文档的只读核查；重点回答两个问题：
+
+- 这些项目如何管理 memory 与 session。
+- 这些项目如何生成、写入或提炼 memory。
+
+先给核心结论：三者都把 **session** 和 **memory** 分层，但“memory”一词在不同项目里指向不同对象。Session 通常是当前/历史对话与运行状态的账本；memory 是跨 session 可复用的知识层。最大的差异在于：OpenClaw 以 session store + JSONL transcript tree 为主，并通过插件/Markdown memory 层召回；OpenHarness 以 JSON snapshot 恢复 session，并用 Markdown memory 文件做长期记忆；Hermes 以 SQLite `state.db` 做 session 主账本，内置 memory 则是冻结进 system prompt 的小型 Markdown 快照。
 
 ## 总览对比
 
-| 项目 | Memory 定位 | Session 定位 | 持久化主体 | 与 agent run 的关系 |
+| 项目 | Session 主体 | Memory 主体 | Memory 注入时机 | Memory 生成方式 |
 | --- | --- | --- | --- | --- |
-| OpenClaw | 插件化长期记忆，典型实现为 bundled `memory-lancedb`；另有文档化的 Markdown/SQLite memory search 体系 | 核心 conversation/runtime 状态，区分 session key、session id、metadata store 和 JSONL transcript | session metadata `sessions.json` + JSONL transcript；memory 默认 LanceDB 或 per-agent SQLite index | memory 在 prompt build 前召回并 prepend context，agent end 后自动捕获；session transcript 保存 conversation tree |
-| OpenHarness/ohmo | Markdown project/personal memory，`MEMORY.md` 作索引；支持 relevant memory、auto-extract、auto-dream | 每轮保存 session snapshot；gateway 维持每 chat/thread 一个 runtime bundle | `~/.openharness/data/...` 或 `~/.ohmo/...` 下的 memory/session JSON/Markdown 文件 | runtime system prompt 注入 memory；每轮保存 messages snapshot；session memory checkpoint 辅助 compact |
-| Hermes Agent | 内置 `MEMORY.md`/`USER.md` 精选长期记忆，外部 memory provider 可扩展 | SQLite `SessionDB` 是完整 session/message 历史与检索源 | `$HERMES_HOME/memories/*` + `$HERMES_HOME/state.db` | 内置 memory 在 agent 初始化冻结为 system prompt；外部 provider 每轮 prefetch/sync；SessionDB 每轮持久化消息 |
+| `hermes-agent` | `$HERMES_HOME/state.db` SQLite，含 `sessions`、`messages`、FTS 表 | `$HERMES_HOME/memories/MEMORY.md`、`USER.md`；外部 provider 可扩展 | 内置 memory 在 session prompt 构建时冻结；外部 provider 在每轮 API call 前注入 user message | 内置 `memory` tool 显式写入；外部 provider 通过 `sync_turn()`、`on_session_end()`、provider tools 提炼或提交 |
+| `openclaw` | `sessions.json` 元数据 + append-only JSONL transcript tree | workspace `MEMORY.md`/`memory/*.md` 的 builtin/index memory；可选 `memory-lancedb` 向量库 | workspace/builtin memory 由 prompt/context/search 体系加载；`memory-lancedb` 在 `before_prompt_build` prepend | `memory-lancedb` 的 `memory_store` tool、`agent_end` auto-capture；compaction 前 memory flush 写文件；dreaming/REM 可推广长期记忆 |
+| `OpenHarness/ohmo` | generic OpenHarness JSON snapshot；ohmo 按 `session_key` 保存 `latest-<hash>.json` | Markdown `MEMORY.md` index + memory entry files；ohmo 有独立 `.ohmo/memory/` | runtime system prompt 加载 memory index，并按最新用户问题选 relevant memories；ohmo prompt 加载 personal memory | `/memory add`/后端 `add_memory_entry()`；generic runtime 可选 `memory_extract`；auto-dream 做后台整理 |
 
-## OpenClaw
+## 对象关系图
 
-### Session 管理
+```mermaid
+flowchart LR
+  subgraph Hermes["hermes-agent"]
+    HUser["user turn"] --> HDB["state.db\nsessions/messages/FTS"]
+    HMemFiles["MEMORY.md + USER.md"] --> HSnapshot["frozen system-prompt snapshot"]
+    HProvider["external MemoryProvider"] --> HPrefetch["prefetch_all()\nAPI-call-time context"]
+    HProvider --> HSync["sync_turn()/on_session_end()"]
+    HDB --> HSearch["session_search"]
+  end
 
-OpenClaw 的 Session 是核心 conversation 状态，不只是聊天路由。它显式区分：
+  subgraph OpenClaw["openclaw"]
+    OCKey["sessionKey"] --> OCStore["sessions.json\nSessionEntry metadata"]
+    OCStore --> OCId["sessionId/sessionFile"]
+    OCId --> OCTranscript["*.jsonl transcript tree\nid + parentId"]
+    OCWorkspace["workspace MEMORY.md\nmemory/*.md"] --> OCIndex["builtin/QMD/SQLite index"]
+    OCLance["memory-lancedb\nLanceDB vectors"] --> OCRecall["before_prompt_build prepend"]
+    OCTranscript --> OCFlush["pre-compaction memory flush"]
+  end
 
-- `sessionKey`：路由/registry key，例如 agent main、channel peer、group/topic 等。
-- `sessionId`：某次实际 transcript/run 的 id，可因 reset、freshness、rotation 改变。
-- session metadata store：`sessions.json`，保存会话级 metadata、状态、插件扩展字段、工具策略、模型 override、compaction/checkpoint 等。
-- JSONL transcript：由 `SessionManager` 维护，是 append-only conversation tree，不是简单线性日志。
+  subgraph OpenHarness["OpenHarness / ohmo"]
+    OHGeneric["generic session"] --> OHSnap["latest.json\nsession-<sid>.json"]
+    OHKey["ohmo session_key"] --> OHKeySnap["latest-<hash>.json"]
+    OHMem["MEMORY.md index\nmemory entry markdown"] --> OHRelevant["relevant memory prompt block"]
+    OHSessionMem["session-memory/<sid>.md"] --> OHCompact["compact continuity"]
+    OHExtract["memory_extract"] --> OHMem
+    OHDream["auto-dream"] --> OHMem
+  end
+```
 
-`SessionEntry` 中保存 `sessionId`、`updatedAt`、`sessionFile`、父子 session、spawn depth、插件扩展、next-turn injections、模型/推理/工具/usage/compaction/memory flush 等大量会话状态。`SessionManager` 的 transcript entry 带 `id`、`parentId`，当前 LLM 上下文从 leaf 回溯到 root，因此分支/fork 不会改写历史，而是选择当前 branch 作为上下文。
+## 生命周期对比
 
-默认 session 持久化路径由 agent id 决定：`<stateDir>/agents/<agentId>/sessions/sessions.json` 与同目录下的 `*.jsonl` transcript。agent run 后，`updateSessionStoreAfterAgentRun()` 将 active `sessionFile`、usage、model/provider、context tokens、compaction 等 run metadata 写回 session store。
+```mermaid
+sequenceDiagram
+  participant U as User message
+  participant S as Session store
+  participant M as Memory recall
+  participant L as LLM turn
+  participant G as Memory generation
 
-### Memory 管理
+  rect rgb(240, 247, 255)
+    note over U,G: hermes-agent
+    U->>S: _persist_session() early user turn
+    M->>L: external prefetch_all() fenced into current user message
+    L->>S: final _persist_session() to JSON log + state.db
+    L->>G: _sync_external_memory_for_turn()
+    G->>G: provider sync_turn(), queue_prefetch(), on_session_end at boundary
+  end
 
-OpenClaw 的长期 memory 主要是插件化能力。subagent 重点核查了 bundled `extensions/memory-lancedb`：
+  rect rgb(245, 255, 245)
+    note over U,G: openclaw
+    U->>S: sessionKey resolves SessionEntry/sessionId
+    M->>L: before_prompt_build returns prependContext
+    L->>S: transcript JSONL append + updateSessionStoreAfterAgentRun()
+    L->>G: agent_end auto-capture if enabled
+    G->>G: memory_store/db.store(), memory flush before compaction, session_end clears cursor
+  end
 
-- `MemoryEntry` 包含 `id`、`text`、`vector`、`importance`、`category`、`createdAt`。
-- 分类包括 `preference`、`fact`、`decision`、`entity`、`other`。
-- 默认 LanceDB 路径是 `~/.openclaw/memory/lancedb`，也可通过插件 `dbPath` 配置覆盖。
-- `MemoryDB` 懒初始化 LanceDB 表，`store()` 写入 vector row，`search()` 走 vector search 并按 score 过滤，`delete()` 先校验 UUID 再删除。
-- 工具层提供 `memory_recall`、`memory_store`、`memory_forget`。
+  rect rgb(255, 248, 238)
+    note over U,G: OpenHarness / ohmo
+    U->>S: restore snapshot by cwd or ohmo session_key
+    M->>L: build_runtime_system_prompt loads MEMORY.md + relevant files
+    L->>S: save_snapshot() latest/session-id/session-key files
+    L->>G: finally: update session-memory, extract durable memories, schedule auto-dream
+    G->>G: add_memory_entry() writes Markdown + MEMORY.md index
+  end
+```
 
-Memory 与 session transcript 是分离的：
+## hermes-agent
 
-1. `before_prompt_build`：如果 auto recall 启用，插件用当前 prompt/latest user text 做 embedding search，把相关 memory 作为 prepend context 注入本轮 prompt；这不写入 transcript。
-2. `agent_end`：成功 run 后，如果 auto capture 启用，插件从 event messages 中抽取值得持久化的 user facts/preferences/decisions，embedding、查重后写入 LanceDB。
-3. `session_end`：清理进程内 auto-capture cursor，不删除长期 memory。
+### 持久化介质
 
-此外，OpenClaw 文档层还有 Markdown memory 体系：`MEMORY.md`、`memory/YYYY-MM-DD.md`、`DREAMS.md`，以及默认 builtin memory engine 将 `MEMORY.md` 和 `memory/*.md` chunks 索引到 owning agent SQLite DB（`agents/<agentId>/agent/openclaw-agent.sqlite`），用于 keyword/vector/hybrid search。
+Hermes 的内置 memory 是小而精选的 Markdown 文件：`$HERMES_HOME/memories/MEMORY.md` 保存 agent notes、项目约定和环境事实，`$HERMES_HOME/memories/USER.md` 保存用户画像和偏好。`MemoryStore` 维护两套状态：`_system_prompt_snapshot` 是 session 开始时冻结的 prompt 快照；`memory_entries` / `user_entries` 是 tool 写入后的 live state。
 
-### 关键理解
+Session 主账本是 `$HERMES_HOME/state.db`。`hermes_state.py` 中的 schema 包含 `sessions`、`messages`、`state_meta`、`compression_locks`，以及 `messages_fts` 和 `messages_fts_trigram`。这意味着 Hermes 不只是保存历史，还把历史做成可检索的 session database。
 
-OpenClaw 的 session 是“conversation 内容和运行状态的真实账本”；memory 是“跨 session 可召回的长期知识层”。Memory recall 影响 prompt 上下文，但不是 session transcript；memory capture 从 run messages 中提炼事实，但不改变已存在 transcript。
+### Session 标识与恢复
+
+`sessions` 表保存 session metadata：`id`、`source`、`user_id`、`model`、`model_config`、`system_prompt`、`parent_session_id`、`started_at`、`ended_at`、`cwd`、`title`、handoff/rewind/archive 等字段。`messages` 表保存完整消息流：`role`、`content`、`tool_calls`、`tool_name`、reasoning/codex 字段、平台 message id、active 标记等。
+
+`run_conversation()` 每条用户消息运行一次。`build_turn_context()` 会先把本轮 user message append 到 working messages，并在模型调用前调用 `_persist_session()` 做 crash-resilient 持久化；turn 结束时 `finalize_turn()` 再调用 `_persist_session()`，把完整 user/assistant/tool 链写入 JSON log 和 SQLite。
+
+### Memory 注入时机
+
+内置 memory 在 system prompt 构建时注入，并且整个 session 内冻结。这是 Hermes prompt caching 设计的一部分：session 中途 `memory` tool 写入会立即落盘，但不会改变当前 session 的 system prompt snapshot。
+
+外部 memory provider 不走这个冻结层。`MemoryManager.prefetch_all()` 在每轮开始前召回相关上下文，`conversation_loop.py` 把这段内容用 `<memory-context>` 包起来，只注入当前 API call 的 user message。源码注释明确说这不会 mutate `messages`，因此不会进入 session persistence。
+
+### Memory 如何生成
+
+Hermes 有两类生成路径：
+
+- 内置 memory：模型调用 `memory` tool 执行 `add`、`replace`、`remove`、`read` 等操作，`MemoryStore` 在文件锁下重读、去重、扫描 threat patterns、检查字符上限，然后原子写入 `MEMORY.md` 或 `USER.md`。文档中有一处“没有 read action”的说法与实现提示存在张力，源码的阻断提示会建议用 `memory(action=read)` 检查被拦截条目。
+- 外部 provider：`MemoryProvider` 定义 `prefetch()`、`sync_turn()`、`on_session_end()`、`on_session_switch()`、`on_pre_compress()`、`on_memory_write()` 等生命周期。`MemoryManager.sync_all()` 在后台单 worker 上顺序调用 provider 的 `sync_turn()`，把已完成 turn 交给 provider；真实提炼逻辑由 Hindsight、OpenViking、Mem0 等 provider 自己实现。
+
+`_sync_external_memory_for_turn()` 会跳过 interrupted turn，避免把用户没看到的 partial response 或被中断工具链写成长久记忆。
+
+### 与 Compaction 的关系
+
+Hermes 的压缩与 session lineage 紧密相关。`compression_locks` 防止多个 agent 同时压缩同一 session；`parent_session_id` 串联压缩后续 session。外部 provider 可以在 `on_pre_compress()` 把压缩前需要保留的 insights 放进 compression summary prompt，也可以在 `on_session_switch()` 处理 `/resume`、`/branch`、`/reset`、compression 等 session id 旋转。
+
+### 关键证据
+
+- `hermes-agent/tools/memory_tool.py`：`MemoryStore`、`_system_prompt_snapshot`、文件锁、threat scan、字符上限。
+- `hermes-agent/agent/memory_provider.py`：外部 provider 生命周期。
+- `hermes-agent/agent/memory_manager.py`：`prefetch_all()`、`sync_all()`、`on_session_end()`、单 worker 后台写入。
+- `hermes-agent/agent/turn_context.py`：turn 开始时早期 session persistence 和 external memory prefetch。
+- `hermes-agent/agent/conversation_loop.py`：prefetch context 只注入当前 API user message。
+- `hermes-agent/run_agent.py`：`_persist_session()`、`_flush_messages_to_session_db()`、`_sync_external_memory_for_turn()`。
+- `hermes-agent/hermes_state.py`：SQLite session schema、FTS、compression locks。
+
+## openclaw
+
+### 持久化介质
+
+OpenClaw 的 session 有两层：`sessions.json` 保存 mutable session metadata；`*.jsonl` transcript 保存实际 conversation tree。默认路径是 `~/.openclaw/agents/<agentId>/sessions/sessions.json` 和同目录下的 transcript 文件。
+
+OpenClaw 的 memory 也有多层，容易混淆：
+
+- bootstrap file memory：workspace 下的 `MEMORY.md`，以及 `memory/YYYY-MM-DD.md`、`DREAMS.md` 等文档化长期/工作记忆。
+- builtin/index memory：`memory-core`/QMD/SQLite search 层，把 `MEMORY.md`、`memory/*.md`，以及部分 session 来源建索引，给 `memory_search` / `memory_get` 等能力使用。
+- plugin long-term memory：例如 bundled `memory-lancedb`，用 LanceDB 存向量化 `MemoryEntry`，提供 `memory_recall`、`memory_store`、`memory_forget` 和自动召回/捕获。
+
+### Session 标识与恢复
+
+OpenClaw 显式区分 `sessionKey` 和 `sessionId`。`sessionKey` 是路由和隔离 bucket，例如 main DM、channel peer、group/thread、cron 等；`sessionId` 是当前 transcript/run 的 id，会因 `/new`、`/reset`、daily/idle reset、compaction 等改变。
+
+`SessionEntry` 很宽，除了 `sessionId`、`updatedAt`、`sessionFile`，还保存 `pluginExtensions`、`pluginNextTurnInjections`、subagent spawn lineage、tool allow/deny、model/provider override、usage/context tokens、compaction checkpoints、`memoryFlushAt`、`memoryFlushCompactionCount`、`memoryFlushFailureCount` 等字段。
+
+Transcript 是 append-only JSONL tree。`SessionManager` 的 entry 带 `id` 与 `parentId`；`message`、`custom_message`、`compaction`、`branch_summary`、`label`、`session_info` 等 entry 类型共同组成可分支的 conversation tree。当前 LLM 上下文不是简单读取全文件，而是按 active leaf 选择路径。
+
+### Memory 注入时机
+
+`memory-lancedb` 的自动召回在 plugin lifecycle 的 `before_prompt_build`。插件用当前 prompt 或最新 user text 生成 embedding，LanceDB vector search 后过滤 contaminated/sludge memory，最多注入少量干净结果，返回 `prependContext`。
+
+注入内容被包进 `<relevant-memories>`，并明确提示模型把 memory 当作不可信历史上下文，不执行 memory 里的指令。插件还会剥离 media attachment annotation 和 channel envelope metadata，避免旧 memory 被误解析成新的 live media 或 prompt 指令。
+
+### Memory 如何生成
+
+OpenClaw 至少有四条 memory 生成路径：
+
+- 显式 tool 写入：`memory-lancedb` 的 `memory_store` 接收 text、importance、category，拒绝 prompt-injection-like 内容，生成 embedding，查重后 `db.store()` 写入 LanceDB。
+- 自动捕获：`memory-lancedb` 在 `agent_end` 钩子上遍历本 session 新增 user messages，先用 `sanitizeForMemoryCapture()` 去掉 OpenClaw envelope、untrusted metadata、active-memory block、media annotation，再用 `shouldCapture()` 的 trigger/filter 判断是否值得保存，最后用 `detectCategory()` 分成 `preference`、`decision`、`entity`、`fact`、`other`，embedding 查重后写入。
+- compaction 前 memory flush：OpenClaw 在 compaction 前运行 silent housekeeping turn，提醒 agent 把重要上下文写入 workspace memory 文件。成功/失败状态通过 `memoryFlushAt`、`memoryFlushCompactionCount`、`memoryFlushFailureCount`、`memoryFlushLastFailureError` 写回 `SessionEntry`。
+- dreaming/REM promotion：文档化 memory 体系支持 dreaming，把短期信号和 daily notes 进一步筛选、推广到长期 `MEMORY.md` 或 review diary。
+
+注意：builtin/index memory 的 `sync()` 本身更多是索引/召回机制，不等于生成新 memory。真正的新 memory 仍来自文件写入、memory tool、auto-capture、memory flush 或 dreaming promotion。
+
+### 与 Compaction 的关系
+
+OpenClaw 的 compaction 会写 `compaction` transcript entry，并在 `SessionEntry` 里维护 compaction 相关 metadata。Memory flush 是 compaction 前的防丢上下文步骤：它不直接改 transcript tree 的历史，而是让 agent 先把可能被压缩丢失的关键事实写进 memory 文件，再继续压缩。
+
+### 关键证据
+
+- `openclaw/src/config/sessions/types.ts`：`SessionEntry`、compaction checkpoint、plugin extension、memory flush 字段。
+- `openclaw/src/agents/sessions/session-manager.ts`：JSONL transcript tree、entry 类型、`id`/`parentId`。
+- `openclaw/src/config/sessions/transcript-tree.ts`：active leaf/path 解析。
+- `openclaw/src/agents/command/session-store.ts`：`updateSessionStoreAfterAgentRun()` 写回 run metadata、usage、session file、compaction count。
+- `openclaw/extensions/memory-lancedb/index.ts`：`MemoryDB.store()`/`search()`、`memory_store`/`memory_recall`/`memory_forget`、`before_prompt_build`、`agent_end`、`session_end`。
+- `openclaw/extensions/memory-lancedb/config.ts`：默认 LanceDB 路径、embedding/provider 配置、autoCapture/autoRecall 默认。
+- `openclaw/src/auto-reply/reply/agent-runner-memory.ts`：preflight compaction 与 memory flush metadata。
+- `openclaw/docs/concepts/memory.md`：workspace `MEMORY.md`、`memory/*.md`、dreaming、automatic memory flush。
 
 ## OpenHarness / ohmo
 
-> 注：用户称 OpenHarmony；仓库中未发现 `OpenHarmony` 目录，相关项目是 `OpenHarness` 与其 personal-agent app `ohmo`。
+### 持久化介质
 
-### Memory 管理
+OpenHarness generic runtime 的 session 是 JSON snapshot，而不是 transcript tree 或 SQLite。`OpenHarnessSessionBackend` 把项目 session 存到 project-hash 目录，写 `latest.json` 和 `session-<sid>.json`。payload 包含 `session_id`、`cwd`、`model`、`system_prompt`、`messages`、`usage`、白名单 `tool_metadata`、`summary`、`message_count`。
 
-OpenHarness/ohmo 存在三层 memory/session 概念，容易混淆：
+ohmo 是 OpenHarness 上的 personal-agent 封装，有独立 workspace。它把 session 存在 `.ohmo/sessions/`，除了 `latest.json` 和 `session-<sid>.json`，还按 gateway chat/thread 的 `session_key` 写 `latest-<sessionKeyHash>.json`。
 
-1. **Durable Project/Personal Memory**：跨 session 长期记忆，Markdown 文件存储，`MEMORY.md` 是索引入口。OpenHarness 默认以 `~/.openharness/data/memory/<project-name>-<sha1>/` 组织项目记忆；ohmo 则用 `~/.ohmo/memory/` 或显式 `OHMO_WORKSPACE` 下的 `memory/`。
-2. **Session Snapshot**：完整 conversation messages、system prompt、model、usage、tool metadata 的 JSON 快照，用于 continue/resume。
-3. **File-backed Session Memory**：为 auto-compact/长对话压缩服务的 per-session Markdown checkpoint，包含当前目标、下一步、已验证工作、活跃 artifacts、最近对话摘要；它不是 durable memory。
+Memory 侧也分两层：
 
-ohmo 的 memory helper 将每条 personal memory 写成 Markdown 文件并更新 `memory/MEMORY.md` 索引。`add_memory_entry()` 使用 `.memory.lock` 文件锁、计算 signature 去重、写 frontmatter（schema version、id、name、description、type/category/importance/source/signature/time/ttl/disabled 等），重复则更新现有文件。`remove_memory_entry()` 是软删除：设置 `disabled=True` 并从 index 移除行。
+- generic project memory：`~/.openharness/data/memory/<project-name>-<sha1>/` 下的 Markdown memory files，入口是 `MEMORY.md` index。
+- ohmo personal memory：`.ohmo/memory/` 下的 Markdown memory files，入口也是 `MEMORY.md`，但命令后端、workspace root、prompt 注入逻辑是 ohmo 自己的。
 
-runtime system prompt 会把 memory directory、`MEMORY.md` 以及相关 memory 文件内容注入 prompt。OpenHarness 的 generic project memory 还支持 usage index、relevant memory selection、auto-extract（默认关闭）和 auto-dream（默认关闭）。
+另有 `session-memory/<project-hash>/<session>.md`，这是 compact continuity checkpoint，不是 durable memory。
 
-### Session 管理
+### Session 标识与恢复
 
-OpenHarness generic runtime 用 session snapshots 做 conversation 恢复：保存 `latest.json` 和 `session-<id>.json`，payload 包含 `session_id`、`cwd`、`model`、`system_prompt`、`messages`、`usage`、白名单 `tool_metadata`、`summary`、`message_count` 等。
+generic OpenHarness 以 cwd/project hash 找最新 snapshot，`/resume` 可以按 id 载入 `session-<sid>.json`。ohmo gateway 则维护 `session_key -> RuntimeBundle` 的 runtime pool：
 
-ohmo 覆盖了 session backend，使用 `.ohmo/sessions`：
+- 同一个 `session_key` 且 cwd 不变时，复用已有 bundle，只刷新 system prompt。
+- cwd 改变时关闭旧 bundle 并重建。
+- 没有 bundle 时，先用 `load_latest_for_session_key(session_key)` 恢复 messages/tool metadata，再 `build_runtime()`。
+- 每轮后 `_save_snapshot()` 写回 `OhmoSessionBackend`，同时更新全局 latest 与 session-key latest。
 
-- `latest.json`：全局最近 session。
-- `latest-<sessionKeyHash>.json`：每个 gateway chat/thread session 的最近 snapshot。
-- `session-<sid>.json`：按 session id 保存的快照。
+### Memory 注入时机
 
-`OhmoSessionRuntimePool` 在 gateway 中维护 `session_key -> RuntimeBundle`：
+generic runtime 的 `build_runtime_system_prompt()` 会加载 memory prompt。`MEMORY.md` 被当作索引入口；系统会基于最新 user prompt 选择 relevant memory files，并用 `format_relevant_memories()` 把文件内容放进 prompt context。
 
-- 如果同一 `session_key` 且 cwd 未变，复用已有 bundle，仅刷新 system prompt。
-- 如果 cwd 变化，关闭旧 bundle 并重建。
-- 如果没有 bundle，先按 `session_key` 加载最近 snapshot，恢复 messages 和 tool metadata，再 build/start runtime。
-- 每轮处理后 `_save_snapshot()` 将当前 engine messages、usage、system prompt、tool metadata 保存到 `OhmoSessionBackend`。
+ohmo 的 `build_ohmo_system_prompt()` 会加载 `SOUL.md`、`IDENTITY.md`、`user.md`、`BOOTSTRAP.md`，然后调用 `ohmo.memory.load_memory_prompt()`，把 `.ohmo/memory/MEMORY.md` 和最多几个 memory 文件直接拼进 system prompt。ohmo 默认 `include_project_memory=False`，因此 personal memory 与 generic project memory 是分开的。
 
-### 关键理解
+### Memory 如何生成
 
-OpenHarness/ohmo 的 durable memory 是 Markdown 知识库，session 是 JSON snapshot 恢复机制；session memory checkpoint 是 compact continuity，不是长期 memory。ohmo gateway 还额外引入了 `session_key` 粒度的 runtime pool，使每个 chat/thread 有独立 bundle 和独立最新快照。
+OpenHarness 的 durable memory 是 Markdown 文件，生成路径包括：
 
-## Hermes Agent
+- 手动或命令写入：`/memory add TITLE :: CONTENT` 最终调用 `add_memory_entry()`。该函数加 `.memory.lock`，计算 signature 查重，写 frontmatter（`schema_version`、`id`、`name`、`description`、`type`、`scope`、`category`、`importance`、`source`、`signature`、`created_at`、`updated_at`、`ttl_days`、`disabled`、`supersedes`、`tags`），再更新 `MEMORY.md` index。
+- generic runtime 可选自动抽取：`QueryEngine.submit_message()` 的 `finally` 顺序是 `_update_session_memory()`、`_extract_durable_memories()`、`_schedule_auto_dream()`。`extract_memories_from_turn()` 会先检查本轮是否已经写过 memory 文件，避免重复；然后让模型按 JSON schema 输出 durable memory candidates，`parse_extraction_records()` 解析后由 `apply_extraction_records()` 写入 Markdown memory。
+- auto-dream：`_schedule_auto_dream()` 在 turn 后 fire-and-forget，做后台 memory consolidation；`/dream` 命令可以手动触发、查看 diff、rollback。
+- ohmo personal memory：`ohmo.memory.add_memory_entry()` 是 ohmo 的独立写入路径，默认 `type=personal`、`category=preference`，同样用 lock、signature 去重、frontmatter 和 `MEMORY.md` index。ohmo 的 `/memory extract` 在命令层明确只支持 OpenHarness project memory，不支持绑定了 ohmo personal backend 的 context；因此 ohmo 的 personal durable memory 主要来自显式 memory 命令/后端写入和 auto-dream 上下文，而不是 generic `/memory extract`。
 
-### Memory 管理
+### 与 Compaction 的关系
 
-Hermes 的内置 memory 是“小而精选”的长期记忆：
+`session-memory` 是 OpenHarness 的 compact continuity 层。`QueryEngine._prepare_session_memory()` 把 `session_memory_path` 放进 `tool_metadata`；turn 后 `_update_session_memory()` 用当前 goal、next step、verified work、active artifacts 和最近消息生成 Markdown checkpoint。auto-compact 时，compact 服务可以读取这个 checkpoint，把它作为跨 compact boundary 的简短 continuity text。
 
-- `MEMORY.md`：agent personal notes / environment facts / project conventions。
-- `USER.md`：用户画像、偏好、沟通风格、工作习惯。
-- 路径是 `$HERMES_HOME/memories/`，通过 `get_hermes_home()` 动态解析，因此支持 profiles。
-- 文件内 entries 用 `§` delimiter 分隔。
+这和 durable memory 不同：session-memory 关注“这段对话接下来怎么继续”，durable memory 关注“未来其他 session 是否还需要知道”。
 
-`MemoryStore` 同时维护两套状态：
+### 关键证据
 
-1. `_system_prompt_snapshot`：`load_from_disk()` 时捕获，进入 system prompt，整个 session 内冻结不变。
-2. live state：`memory_entries` / `user_entries`，tool 写入后立即落盘，但不会改变当前 session 的 system prompt。
-
-这正是 Hermes prompt caching 设计的一部分：会话中途不重建系统提示、不改变历史上下文、不破坏 prefix cache。`MemoryStore.load_from_disk()` 会扫描 threat patterns，危险 entry 在 system prompt snapshot 中替换成 `[BLOCKED: ...]` 占位符，但 live state 保留原文，便于用户读取并删除。
-
-Hermes 还有外部 memory provider 架构：
-
-- `MemoryProvider` 定义 `initialize()`、`system_prompt_block()`、`prefetch()`、`sync_turn()`、tools、`shutdown()` 等生命周期。
-- `MemoryManager` 是统一编排点：只允许一个 external provider，负责 tool schema 注入、每轮 prefetch、每轮结束 sync，以及后台单 worker 顺序写入。
-- provider 初始化会拿到 `hermes_home`、`session_id`、platform、agent identity、gateway session key、profile 等上下文。
-
-### Session 管理
-
-Hermes 的核心 session store 是 SQLite `SessionDB`，默认路径 `$HERMES_HOME/state.db`。schema 包括：
-
-- `sessions`：session metadata、source、user_id、model/config、system_prompt、parent_session_id、started/ended、end_reason、message/tool/token/cost counters、cwd、title、handoff、rewind/archive 等。
-- `messages`：session_id、role、content、tool calls、tool name、timestamp、token、reasoning/codex fields、platform message id、observed、active 等。
-- `messages_fts` 与 trigram FTS5：全文检索和 CJK/substring search。
-- `compression_locks`：防止多个 agent 对同一 session 同时 compression 造成 split race。
-
-`AIAgent.run_conversation()` 是每条用户消息一轮的入口。典型流程：
-
-1. caller（CLI/gateway）持有 `conversation_history` 和 `session_id`。
-2. turn context 复制 history，append 当前 user message。
-3. 若 cached system prompt 不存在，构建一次；内置 memory snapshot 在这里进入 prompt。
-4. 在模型调用前先 `_persist_session()`，使入站 user turn crash-resilient。
-5. 外部 memory provider `prefetch_all()` 的召回上下文被拼到当前 API user message；它不 mutate `messages`，不会进入 session persistence。
-6. turn finalizer 结束时再次 `_persist_session()`，把完整 turn 写 JSON log 与 SQLite，并返回更新后的 `messages` 和 `session_id` 给 caller。
-7. 正常 turn 后 `_sync_external_memory_for_turn()` 异步同步当前 turn 到 external providers；interrupted turn 跳过，避免污染 memory。
-
-生命周期边界很重要：`run_conversation()` 每条消息都会调用，所以 `on_session_end()` / `shutdown_all()` 不在每 turn 调用；真正 session boundary（CLI 退出、`/new`、`/reset`、gateway session expire、session id rotate 等）才调用 `shutdown_memory_provider()` 或 `commit_memory_session()`。
-
-### 关键理解
-
-Hermes 把 memory 和 session 分得很清楚：memory 是精选、冻结注入的长期上下文；session 是完整消息历史和搜索/恢复账本。外部 provider 的 prefetch 是 API-call-time 临时注入，不改变持久 transcript；sync turn 是每轮结束后的异步长期记忆更新。
+- `OpenHarness/src/openharness/services/session_storage.py`：generic snapshot payload、`latest.json`、`session-<sid>.json`。
+- `OpenHarness/ohmo/session_storage.py`：ohmo `latest-<sessionKeyHash>.json` 与 `OhmoSessionBackend`。
+- `OpenHarness/ohmo/gateway/runtime.py`：`OhmoSessionRuntimePool`、bundle restore/reuse、session-key snapshot save。
+- `OpenHarness/src/openharness/engine/query_engine.py`：turn finally 顺序：session-memory、memory extraction、auto-dream。
+- `OpenHarness/src/openharness/memory/manager.py`：`add_memory_entry()`、soft delete、frontmatter/index 更新。
+- `OpenHarness/src/openharness/memory/schema.py`：memory metadata schema、signature、`MEMORY.md` 作为 index 的 policy。
+- `OpenHarness/src/openharness/memory/relevance.py`：relevant memory selection/formatting。
+- `OpenHarness/src/openharness/services/memory_extract/__init__.py`：LLM JSON extraction、write guard、apply records。
+- `OpenHarness/src/openharness/services/session_memory/__init__.py`：file-backed session memory checkpoint。
+- `OpenHarness/ohmo/memory.py`：ohmo personal memory backend。
 
 ## 横向结论
 
-1. **三者都把 Memory 与 Session 分层。** Memory 面向跨 session 的 durable knowledge；Session 面向当前/历史 conversation 和运行状态。
-2. **Memory 注入时机差异很大。** OpenClaw 在 plugin `before_prompt_build` prepend；OpenHarness 在 runtime system prompt 中加载 project/personal memory；Hermes 内置 memory 在 agent 初始化时冻结为 system prompt，外部 provider 则 per-turn API-only 注入。
-3. **Session 持久化模型不同。** OpenClaw 是 metadata store + JSONL conversation tree；OpenHarness/ohmo 是 JSON snapshot；Hermes 是 SQLite sessions/messages + FTS，另有 JSON log。
-4. **压缩/长上下文处理都与 session 相关，但不等同于 memory。** OpenHarness 的 session memory checkpoint 是 compact continuity；Hermes compression 会 split session 并使用 locks；OpenClaw session entry 有 compaction checkpoints 和 transcript tree 分支。
-5. **自动提取 memory 都谨慎。** OpenClaw memory-lancedb 有 autoCapture cursor 和过滤/查重；OpenHarness auto-extract/auto-dream 默认关闭；Hermes external providers 每轮 sync 但内置 memory 仍需 tool 明确写入且不改变当前 prompt snapshot。
+1. Session 是账本，memory 是可复用知识层。OpenClaw 的账本是 `sessions.json` + JSONL tree；OpenHarness 是 JSON snapshot；Hermes 是 SQLite `state.db`。
+2. Memory 注入都尽量不等同于 transcript 写入。OpenClaw 的 auto recall 返回 prepend context；OpenHarness 把 relevant Markdown memory 放进 runtime prompt；Hermes 外部 provider 只在当前 API user message 注入，不写回 session persistence。
+3. Memory 生成都带过滤/边界。OpenClaw 清洗 channel envelope 并按 trigger 捕获；OpenHarness 抽取前检查本轮是否已写 memory，输出 JSON 后再入库；Hermes 内置 memory 有 threat scan、字符上限和文件漂移保护，外部 provider 跳过 interrupted turn。
+4. Compaction continuity 不应误读为 durable memory。OpenHarness 的 `session-memory` 是 compact checkpoint；OpenClaw 的 memory flush 是 compaction 前的防丢写入；Hermes 的 compression lineage 通过 SQLite parent session 和 provider hooks 处理。
+5. 三者都避免把所有历史无脑塞进长期 memory。长期 memory 应该是稳定偏好、事实、决定、项目约定或可复用 troubleshooting 结果；raw transcript、日志、临时计划和大段工具输出应该留在 session/history 层。
 
-## 调研命令记录
+## 文档与源码张力
 
-- `pwd && find .. -name AGENTS.md -print`
-- `git status --short`
-- `rg -n "memory|session|Memory|Session|conversation|thread" openclaw/src openclaw/docs OpenHarness/ohmo OpenHarness/src/openharness hermes-agent/agent hermes-agent/tools hermes-agent/gateway hermes-agent/hermes_cli`
-- `rg --files openclaw/src | rg 'session|memory|state|store|transcript'`
-- `sed -n` / `nl -ba` 查看 OpenClaw、OpenHarness/ohmo、Hermes Agent 的关键源码范围。
+- OpenClaw 本地文档把 memory 讲得比较分散：workspace Markdown memory、builtin/QMD search、LanceDB plugin、dreaming/REM 分布在不同文档和插件里。本文档把它们作为不同层次并列说明。
+- OpenHarness README 把 memory/session 作为能力点介绍，但源码中实际存在 project memory、ohmo personal memory、session snapshot、session-memory checkpoint、auto-dream 等多个持久化对象。本文档用对象图拆开。
+- Hermes 文档对 memory 解释较完整，但“没有 `read` action”的用户文档说法与 `MemoryStore` 的 blocked-entry 提示存在实现层张力。调研以源码为准：实现中存在 read/inspect 路径的提示。
+
+## 证据索引
+
+### hermes-agent
+
+- `hermes-agent/tools/memory_tool.py`
+- `hermes-agent/agent/memory_provider.py`
+- `hermes-agent/agent/memory_manager.py`
+- `hermes-agent/agent/turn_context.py`
+- `hermes-agent/agent/conversation_loop.py`
+- `hermes-agent/agent/turn_finalizer.py`
+- `hermes-agent/run_agent.py`
+- `hermes-agent/hermes_state.py`
+- `hermes-agent/tools/session_search_tool.py`
+- `hermes-agent/website/docs/user-guide/features/memory.md`
+- `hermes-agent/website/docs/user-guide/sessions.md`
+
+### openclaw
+
+- `openclaw/src/config/sessions/types.ts`
+- `openclaw/src/config/sessions/store.ts`
+- `openclaw/src/config/sessions/transcript.ts`
+- `openclaw/src/config/sessions/transcript-tree.ts`
+- `openclaw/src/agents/sessions/session-manager.ts`
+- `openclaw/src/agents/command/session-store.ts`
+- `openclaw/src/auto-reply/reply/agent-runner-memory.ts`
+- `openclaw/src/plugins/memory-runtime.ts`
+- `openclaw/src/memory/root-memory-files.ts`
+- `openclaw/extensions/memory-lancedb/index.ts`
+- `openclaw/extensions/memory-lancedb/config.ts`
+- `openclaw/docs/concepts/memory.md`
+- `openclaw/docs/concepts/session.md`
+- `openclaw/docs/reference/session-management-compaction.md`
+
+### OpenHarness / ohmo
+
+- `OpenHarness/src/openharness/services/session_storage.py`
+- `OpenHarness/src/openharness/services/session_backend.py`
+- `OpenHarness/src/openharness/engine/query_engine.py`
+- `OpenHarness/src/openharness/ui/runtime.py`
+- `OpenHarness/src/openharness/memory/manager.py`
+- `OpenHarness/src/openharness/memory/schema.py`
+- `OpenHarness/src/openharness/memory/relevance.py`
+- `OpenHarness/src/openharness/services/memory_extract/__init__.py`
+- `OpenHarness/src/openharness/services/session_memory/__init__.py`
+- `OpenHarness/src/openharness/services/compact/__init__.py`
+- `OpenHarness/ohmo/memory.py`
+- `OpenHarness/ohmo/session_storage.py`
+- `OpenHarness/ohmo/prompts.py`
+- `OpenHarness/ohmo/gateway/runtime.py`
